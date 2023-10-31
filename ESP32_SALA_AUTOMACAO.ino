@@ -1,33 +1,29 @@
 #include <WiFi.h>
-//#include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <Arduino.h>
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include <WiFiUdp.h>
-
 #include <driver/adc.h>
 #include <esp_adc_cal.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_err.h>
 #include <esp_log.h>
-
 #include "HttpRequest.h"
-
-#include "ControllerData.h"
-
-ControllerData controller;
 
 esp_adc_cal_characteristics_t adc_cal;  //Structure that contains information for calibration
 
 bool esp32 = true;  //Change to false for Arduino
 
+int controllerId = 0;
+int thermistorId = 0;
 int count = 0;
-int secondsToSend = 60;
+int timeToReadAgain = 60000;  //Time for read data in miliseconds
+int attempts = 10;            //Number of attempts to connect to the server
+float lastTemperature = 0.0;
 
 int thermistorPin;
-int thermistorId;
+
 double adcMax, Vs;
 
 double R1 = 5120.0;    // Voltage divider resistor 4K7
@@ -42,17 +38,26 @@ IPAddress gateway(172, 31, 210, 1);
 IPAddress subnet(255, 255, 255, 0);
 String macAddress = "";
 
-String urlBase = "http://172.31.210.181:3001";
+String urlBase = "http://172.31.210.181:3001";//Host address and port
 
 const size_t bufferSize = 1024;
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial) {
-    delay(1000);
-  }
+  while (!Serial) {}
 
   Serial.println("Initializing...");
+
+  thermistorPin = 34;
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_0);                                                              //pin 34 esp32 WROOM
+  esp_adc_cal_value_t adc_type = esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_0, ADC_WIDTH_BIT_12, 1100, &adc_cal);  //Start calibration
+  adcMax = 4095.0;                                                                                                        // ADC 12-bit (0-4095)
+  Vs = 3.3;                                                                                                               // Voltage level
+
+  delay(5000);
+
+  Serial.println("Connecting to the network " + String(ssid) + "...");
 
   WiFi.mode(WIFI_STA);
 
@@ -70,7 +75,7 @@ void setup() {
 
   ArduinoOTA.setHostname("ESP32 - AUTOMACAO");
 
-  ArduinoOTA.setPassword("(123456)");
+  ArduinoOTA.setPassword("admin");
 
   // ArduinoOTA.setPasswordHash("21232f297a57a5a743894a0e4a801fc3");
 
@@ -84,113 +89,119 @@ void setup() {
 
   ArduinoOTA.begin();
 
-  Serial.println("Ready!");
-  Serial.print("IP address: ");
+  Serial.println("Connected!");
+  delay(1000);
+  Serial.print("IP Address: ");
   Serial.println(WiFi.localIP());
+  delay(1000);
 
   macAddress = WiFi.macAddress();
 
-  controller.setIpAddress(myIpToString());
-  controller.setMacAddress(macAddress);
-
-  Serial.print("Endereço MAC: ");
+  Serial.print("MAC Address: ");
   Serial.println(macAddress);
 
-  adc1_config_width(ADC_WIDTH_BIT_12);
-  adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_0);                                                              //pin 34 esp32 WROOM
-  esp_adc_cal_value_t adc_type = esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_0, ADC_WIDTH_BIT_12, 1100, &adc_cal);  //Start calibration
-  thermistorPin = 34;
-  adcMax = 4095.0;  // ADC 12-bit (0-4095)
-  Vs = 3.3;         // Voltage level
+  delay(1000);
 
+  Serial.println("Getting data from the controller...");
+
+  getControllerData();
+
+  Serial.println("Ready!");
   delay(2000);
-
-  int count = 0;
-  bool tryAgain = true;
-
-  Serial.println("Obtendo dados do controlador...");
-  /*
-  while (controller.getId() <= 0 && tryAgain) {
-    Serial.println("Dados não encontrados. Realizando cadastro do controlador...");
-    if (count > 10 && controller.getId() <= 0) {
-      count = 0;
-
-      StaticJsonDocument<200> doc;
-      doc["name"] = controller.getName();
-      doc["model"] = controller.getModel();
-      doc["connectionType"] = controller.getConnectionType();
-      doc["ipAddress"] = controller.getIpAddress();
-      doc["macAddress"] = controller.getMacAddress();
-      doc["location"] = controller.getLocation();
-
-      String jsonPayload;
-      serializeJson(doc, jsonPayload);
-
-      String path = "/controllers/create";
-      postData(urlBase + path, jsonPayload);
-    }
-
-    Serial.println(controller.getId());
-    delay(2000);
-    getDeviceId();
-    count++;
-  }*/
-
-  while (true) {
-    String url = urlBase;
-    url += "/controllers/findbyip?ipAddress=";
-    url += myIpToString();
-    String response = getRequest(url);
-
-    Serial.println(response);
-    controller.setId(extractField<int>(response, "id"));
-    controller.setName(extractField<String>(response, "name"));
-    controller.setModel(extractField<String>(response, "model"));
-    controller.setConnectionType(extractField<String>(response, "connectionType"));
-
-    Serial.print("Controller ID: ");
-    Serial.println(controller.getId());
-    Serial.print("Nome: ");
-    Serial.println(controller.getName());
-    Serial.print("Modelo: ");
-    Serial.println(controller.getModel());
-    Serial.print("Conexão: ");
-    Serial.println(controller.getConnectionType());
-    delay(10000);
-
-    url = "";
-    url += urlBase;
-    url += "/thermistors/findbycontrollerport/?controllerId=" + String(controller.getId()) + "&controllerPort=" + String(thermistorPin);
-
-    response = "";
-    response = getRequest(url);
-    thermistorId = extractField<int>(response, "id");
-
-    Serial.print("Thermistor ID: ");
-    Serial.println(thermistorId);
-    delay(10000);
-  }
+  getTemperature(thermistorPin);
 }
 
 void loop() {
-  float temperature = getTemperature();
-
-  Serial.println(controller.getId());
+  ArduinoOTA.handle();
 
   Serial.println("Obtendo dados do sensor...");
 
-  ArduinoOTA.handle();
-  /*
-  if (count == secondsToSend) {
-    temperature = getTemperature();
-    printTemperature(temperature);
-    postSensorValue(temperature, controller.getId());
-    count = 0;
-  }
-*/
-  count++;
+  float actualTemperature = getTemperature(thermistorPin);
 
-  delay(1000);
+  printTemperature(actualTemperature);
+
+  if (actualTemperature != lastTemperature) {
+    lastTemperature = actualTemperature;
+    saveThermistorData(thermistorId, actualTemperature);
+  }
+
+  delay(timeToReadAgain);
+}
+
+void saveThermistorData(int thermistorId, float t) {
+  String path = "/thermistordata/add";
+
+  StaticJsonDocument<200> doc;
+  doc["thermistorId"] = thermistorId;
+  doc["value"] = t;
+
+  String jsonPayload;
+  serializeJson(doc, jsonPayload);
+
+  String response = postRequest(urlBase + path, jsonPayload);
+
+  int statusCode = extractField<int>(response, "statusCode", true);
+
+  if (statusCode == 201) {
+    count = 0;
+  } else {
+    count++;
+    restartSystem();
+  }
+}
+
+void getControllerData() {
+  bool tryAgain = true;
+  while (tryAgain) {
+    if (controllerId <= 0) {
+      Serial.println("Trying to get the controller id...");
+      getControllerId();
+    } else {
+      Serial.println("Trying to get the thermistor id...");
+      getControllerDevices();
+      if (thermistorId > 0) {
+        tryAgain = false;
+      }
+    }
+    delay(5000);
+  }
+}
+
+void getControllerId() {
+  String url = urlBase;
+  url += "/controllers/findbyip?ipAddress=";
+  url += myIpToString();
+  String response = getRequest(url);
+
+  int statusCode = extractField<int>(response, "statusCode", true);
+
+  Serial.print("Status Code: ");
+  Serial.println(statusCode);
+  if (statusCode == 200) {
+    controllerId = extractField<int>(response, "id", false);
+    count = 0;
+  } else {
+    count++;
+    restartSystem();
+  }
+}
+
+void getControllerDevices() {
+  String url = "";
+  url += urlBase;
+  url += "/thermistors/findbycontrollerport/?controllerId=" + String(controllerId) + "&controllerPort=" + String(thermistorPin);
+
+  String response = getRequest(url);
+
+  int statusCode = extractField<int>(response, "statusCode", true);
+
+  if (statusCode == 200) {
+    thermistorId = extractField<int>(response, "id", false);
+    count = 0;
+  } else {
+    count++;
+    restartSystem();
+  }
 }
 
 String myIpToString() {
@@ -208,8 +219,21 @@ String myIpToString() {
   return stringIP;
 }
 
+void restartSystem() {
+  if (count >= attempts) {
+    Serial.println("Unable to communicate with the server");
+    delay(2000);
+    Serial.print("Rebooting");
+    for (int i = 0; i <= 2; i++) {
+      delay(1000);
+      Serial.print(".");
+    }
+    ESP.restart();
+  }
+}
+
 template<typename T>
-T extractField(const String &jsonString, const String &fieldName) {
+T extractField(const String &jsonString, const String &fieldName, bool statusCode) {
   DynamicJsonDocument doc(1024);
 
   DeserializationError error = deserializeJson(doc, jsonString);
@@ -220,38 +244,14 @@ T extractField(const String &jsonString, const String &fieldName) {
     return T(-1);
   }
 
-  if (doc.containsKey("body") && doc["body"].containsKey("data") && doc["body"]["data"].containsKey(fieldName)) {
-    return doc["body"]["data"][fieldName].as<T>();
-  }
-
-  return T(-1);
-}
-
-
-
-/*
-void getDeviceId() {
-  String path = "/controllers/findbyip?ipAddress=";
-  getRequest(urlBase + path + controller.getIpAddress());
-}
-
-void postSensorValue(float temperature, int deviceId) {
-  String path = "/thermistors/addvalue";
-  postRequest(urlBase + path, temperature, deviceId);
-}
-String myIpToString() {
-  String stringIP = "";
-
-  for (int i = 0; i < 4; i++) {
-    if (i < 3) {
-      stringIP += String(ip[i]);
-      stringIP += ".";
-    } else {
-      stringIP += String(ip[i]);
+  if (statusCode) {
+    return doc["body"][fieldName].as<T>();
+  } else {
+    if (doc.containsKey("body") && doc["body"].containsKey("data") && doc["body"]["data"].containsKey(fieldName)) {
+      return doc["body"]["data"][fieldName].as<T>();
     }
   }
-
-  return stringIP;
+  return T(-1);
 }
 
 void printTemperature(float t) {
@@ -259,25 +259,8 @@ void printTemperature(float t) {
   Serial.print(t);
   Serial.println(" °C");
 }
-*/
 
-int extractKeyId(const String &jsonString) {
-  DynamicJsonDocument doc(1024);  // Tamanho do buffer JSON
-
-  DeserializationError error = deserializeJson(doc, jsonString);
-
-  if (error) {
-    Serial.print("Erro ao fazer o parsing do JSON: ");
-    Serial.println(error.c_str());
-    return -1;  // Retorna -1 em caso de erro
-  }
-
-  int id = doc["body"]["data"]["id"];
-
-  return id;
-}
-
-float getTemperature() {
+float getTemperature(int thermistorPin) {
   uint32_t AD = 0;
   for (int i = 0; i < 100; i++) {
     AD += adc1_get_raw(ADC1_CHANNEL_6);  //Get RAW value from ADC
